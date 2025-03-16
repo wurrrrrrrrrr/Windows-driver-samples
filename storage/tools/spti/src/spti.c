@@ -73,6 +73,356 @@ LPCSTR BusTypeStrings[] = {
 };
 #define NUMBER_OF_BUS_TYPE_STRINGS (sizeof(BusTypeStrings)/sizeof(BusTypeStrings[0]))
 
+
+typedef struct {
+    int disk_number;     // --disk
+    int is_write;        // --write flag
+    int is_read;         // --read flag
+    unsigned long lba;   // --lba 
+    unsigned int sector_cnt; // --sector_cnt
+    unsigned char data_pattern; // --data
+} CommandLineArgs;
+
+void print_usage(const char* program_name) {
+    printf("Usage: %s [options]\n", program_name);
+    printf("Options:\n");
+    printf("  --disk <number>      Select disk number\n");
+    printf("  --write             Perform write operation\n");
+    printf("  --read              Perform read operation\n");
+    printf("  --lba <address>     Specify starting logical block address\n");
+    printf("  --sector_cnt <count> Specify number of sectors to operate on\n");
+    printf("  --data <pattern>    Specify hex pattern to write (e.g., FF)\n");
+    printf("\nExamples:\n");
+    printf("  %s --disk 0 --write --lba 0 --sector_cnt 1 --data FF\n", program_name);
+    printf("  %s --disk 1 --read --lba 100 --sector_cnt 10\n", program_name);
+}
+
+int parse_arguments(int argc, char* argv[], CommandLineArgs* args) {
+    memset(args, 0, sizeof(CommandLineArgs));
+    args->disk_number = -1; // Invalid disk number by default
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--disk") == 0) {
+            if (++i >= argc) {
+                printf("Error: --disk requires a number\n");
+                return 0;
+            }
+            args->disk_number = atoi(argv[i]);
+            if (args->disk_number < 0) {
+                printf("Error: Invalid disk number\n");
+                return 0;
+            }
+        }
+        else if (strcmp(argv[i], "--write") == 0) {
+            args->is_write = 1;
+        }
+        else if (strcmp(argv[i], "--read") == 0) {
+            args->is_read = 1;
+        }
+        else if (strcmp(argv[i], "--lba") == 0) {
+            if (++i >= argc) {
+                printf("Error: --lba requires a value\n");
+                return 0;
+            }
+            args->lba = strtoul(argv[i], NULL, 0);
+        }
+        else if (strcmp(argv[i], "--sector_cnt") == 0) {
+            if (++i >= argc) {
+                printf("Error: --sector_cnt requires a value\n");
+                return 0;
+            }
+            args->sector_cnt = (unsigned int)strtoul(argv[i], NULL, 0);
+        }
+        else if (strcmp(argv[i], "--data") == 0) {
+            if (++i >= argc) {
+                printf("Error: --data requires a hex value\n");
+                return 0;
+            }
+            unsigned int temp;
+            if (sscanf(argv[i], "%x", &temp) != 1) {
+                printf("Error: Invalid hex value for --data\n");
+                return 0;
+            }
+            args->data_pattern = (unsigned char)temp;
+        }
+        else {
+            printf("Error: Unknown option: %s\n", argv[i]);
+            return 0;
+        }
+    }
+
+    // Validate arguments
+    if (args->disk_number == -1) {
+        printf("Error: --disk is required\n");
+        return 0;
+    }
+
+    if (!(args->is_read || args->is_write)) {
+        printf("Error: Either --read or --write must be specified\n");
+        return 0;
+    }
+
+    if (args->is_read && args->is_write) {
+        printf("Error: Cannot specify both --read and --write\n");
+        return 0;
+    }
+
+    if (args->is_write && args->data_pattern == 0 && !argv[1]) {
+        printf("Warning: No data pattern specified for write operation, using 0x00\n");
+    }
+
+    if (args->sector_cnt == 0) {
+        printf("Error: --sector_cnt must be greater than 0\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+BOOL GetDiskPath(int diskNumber, LPSTR devicePath, size_t devicePathSize) {
+    if (sprintf_s(devicePath, devicePathSize, "\\\\.\\PhysicalDrive%d", diskNumber) < 0) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void PerformWrite(HANDLE fileHandle, CommandLineArgs* args, ULONG alignmentMask) {
+    PUCHAR dataBuffer = NULL;
+    PUCHAR pUnAlignedBuffer = NULL;
+    DWORD returned = 0;
+    const DWORD SECTOR_SIZE = 512;
+    BOOL status = FALSE;
+
+    printf("\n*********************************************** start write ****************************************************\n");
+    printf("disk: %d\n", args->disk_number);
+    printf("LBA start: %lu\n", args->lba);
+    printf("sector_cnt: %u\n", args->sector_cnt);
+    printf("data pattern: 0x%02X\n", args->data_pattern);
+
+    // 1. �]�m�ö�R�w�İ�
+    DWORD bufferSize = args->sector_cnt * SECTOR_SIZE;
+    dataBuffer = AllocateAlignedBuffer(bufferSize, alignmentMask, &pUnAlignedBuffer);
+
+    if (!dataBuffer) {
+        printf("Error�Gcan't allocate memory!\n");
+        return;
+    }
+
+
+    // �Ϋ��w���Ҧ���R�w�İ�
+    memset(dataBuffer, args->data_pattern, bufferSize);
+
+    // 2. �]�m SCSI Pass Through Direct ���c
+    SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER sptdwb = { 0 };
+
+    sptdwb.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    sptdwb.sptd.PathId = 0;
+    sptdwb.sptd.TargetId = 0;  // �����X�ݺϺ�
+    sptdwb.sptd.Lun = 0;
+
+    sptdwb.sptd.CdbLength = 16;  // WRITE(16)
+    sptdwb.sptd.DataIn = SCSI_IOCTL_DATA_OUT;  // �g�J�ާ@
+    sptdwb.sptd.DataTransferLength = bufferSize;
+    sptdwb.sptd.TimeOutValue = 60;  // �W�[�W�ɮɶ�
+    sptdwb.sptd.DataBuffer = dataBuffer;
+
+    sptdwb.sptd.SenseInfoLength = SPT_SENSE_LENGTH;
+    sptdwb.sptd.SenseInfoOffset = offsetof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER, ucSenseBuf);
+
+    // �]�m WRITE(16) CDB
+    sptdwb.sptd.Cdb[0] = 0x8A;     // WRITE(16) �ާ@�X
+    sptdwb.sptd.Cdb[1] = 0x00;     // �g�J�ﶵ
+
+    // 64-bit LBA - �����]�m���쬰 0 �]���w��W�欰2048LBA �ҥH32bits�w����
+    sptdwb.sptd.Cdb[2] = 0x00;    // LBA [63:56]
+    sptdwb.sptd.Cdb[3] = 0x00;    // LBA [55:48]
+    sptdwb.sptd.Cdb[4] = 0x00;    // LBA [47:40]
+    sptdwb.sptd.Cdb[5] = 0x00;    // LBA [39:32]
+
+    sptdwb.sptd.Cdb[6] = (UCHAR)(args->lba >> 24);  // LBA [31:24]
+    sptdwb.sptd.Cdb[7] = (UCHAR)(args->lba >> 16);  // LBA [23:16]
+    sptdwb.sptd.Cdb[8] = (UCHAR)(args->lba >> 8);   // LBA [15:8]
+    sptdwb.sptd.Cdb[9] = (UCHAR)(args->lba);        // LBA [7:0]
+
+    // �]�m�ǿ���ס]���ϼơ^
+    sptdwb.sptd.Cdb[10] = (UCHAR)(args->sector_cnt >> 24);
+    sptdwb.sptd.Cdb[11] = (UCHAR)(args->sector_cnt >> 16);
+    sptdwb.sptd.Cdb[12] = (UCHAR)(args->sector_cnt >> 8);
+    sptdwb.sptd.Cdb[13] = (UCHAR)(args->sector_cnt);
+
+    sptdwb.sptd.Cdb[14] = 0x00;  // Reserved
+    sptdwb.sptd.Cdb[15] = 0x00;  // Control
+
+    // 3. ���� SCSI �R�O
+    status = DeviceIoControl(fileHandle,
+        IOCTL_SCSI_PASS_THROUGH_DIRECT,
+        &sptdwb,
+        sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER),
+        &sptdwb,
+        sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER),
+        &returned,
+        NULL);
+
+    // 4. 檢查執行結果
+    if (!status) {
+        printf("DeviceIoControl failed, error code: %lu\n", GetLastError());
+        printf("Write failed, please turn off write protection.\n");
+        /*PrintError(GetLastError());*/
+    }
+    else if (sptdwb.sptd.ScsiStatus != 0) {
+        printf("SCSI Command Failed, SCSI Status: %02Xh\n", sptdwb.sptd.ScsiStatus);
+        PrintSenseInfo((PSCSI_PASS_THROUGH_WITH_BUFFERS)&sptdwb);
+    }
+    else {
+        printf("\nWrite data completed (LBA: %u to %u)\n",
+            args->lba, args->lba + args->sector_cnt - 1);
+        printf("Pattern: 0x%02X\n", args->data_pattern);
+        printf("Total bytes written: %lu\n", bufferSize);
+        printf("Done!\n");
+    }
+
+    // 5. 清理資源
+    if (pUnAlignedBuffer) {
+        free(pUnAlignedBuffer);
+    }
+    printf("\n*********************************************** write end ****************************************************\n");
+}
+void PerformRead(HANDLE fileHandle, CommandLineArgs* args, ULONG alignmentMask) {
+    printf("\n*********************************************** start read ****************************************************\n");
+    // �ϥΤw����� fileHandle �M alignmentMask
+    PUCHAR dataBuffer = NULL;
+    PUCHAR pUnAlignedBuffer = NULL;
+    DWORD returned = 0;
+    const DWORD SECTOR_SIZE = 512;
+    BOOL status = FALSE;
+
+    printf("disk: %d\n", args->disk_number);
+    printf("LBA start: %lu\n", args->lba);
+    printf("sector_cnt: %u\n", args->sector_cnt);
+
+    // 1. ���t������w�İ� (sector_cnt * 512 bytes)
+    DWORD bufferSize = args->sector_cnt * SECTOR_SIZE;
+    dataBuffer = AllocateAlignedBuffer(bufferSize, alignmentMask, &pUnAlignedBuffer);
+
+    if (!dataBuffer) {
+        printf("Error�Gcan't allocate memory!\n");
+        return;
+    }
+
+    // 2. �]�m SCSI Pass Through Direct ���c
+    SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER sptdwb = { 0 };
+
+    sptdwb.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    sptdwb.sptd.PathId = 0;     // 0:�Ĥ@�Ӹ��|
+    sptdwb.sptd.TargetId = 0;   // 0:�����X�ݺϺ�
+    sptdwb.sptd.Lun = 0;        // �޿�椸���A�q�` 0
+
+    sptdwb.sptd.CdbLength = 16;  // Read(16)
+    sptdwb.sptd.DataIn = SCSI_IOCTL_DATA_IN;
+    sptdwb.sptd.DataTransferLength = bufferSize;
+    sptdwb.sptd.TimeOutValue = 60;  // �W�[�W�ɮɶ��H�B�z�j�q�ƾ�
+    sptdwb.sptd.DataBuffer = dataBuffer;
+
+    sptdwb.sptd.SenseInfoLength = SPT_SENSE_LENGTH;
+    sptdwb.sptd.SenseInfoOffset = offsetof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER, ucSenseBuf);
+
+    // READ(16) CDB �]�m
+    sptdwb.sptd.Cdb[0] = 0x88;     // READ(16) �ާ@�X
+    sptdwb.sptd.Cdb[1] = 0x00;
+    // �]�m 64-bit LBA 
+    //sptdwb.sptd.Cdb[2] = (UCHAR)(args->lba >> 56);  // LBA [63:56]
+    //sptdwb.sptd.Cdb[3] = (UCHAR)(args->lba >> 48);  // LBA [55:48]
+    //sptdwb.sptd.Cdb[4] = (UCHAR)(args->lba >> 40);  // LBA [47:40]
+    //sptdwb.sptd.Cdb[5] = (UCHAR)(args->lba >> 32);  // LBA [39:32]
+    sptdwb.sptd.Cdb[2] = 0x00;     // LBA [63:56]
+    sptdwb.sptd.Cdb[3] = 0x00;     // LBA [55:48]
+    sptdwb.sptd.Cdb[4] = 0x00;     // LBA [47:40]
+    sptdwb.sptd.Cdb[5] = 0x00;     // LBA [39:32]
+    sptdwb.sptd.Cdb[6] = (UCHAR)(args->lba >> 24);  // LBA [31:24]
+    sptdwb.sptd.Cdb[7] = (UCHAR)(args->lba >> 16);  // LBA [23:16]
+    sptdwb.sptd.Cdb[8] = (UCHAR)(args->lba >> 8);   // LBA [15:8]
+    sptdwb.sptd.Cdb[9] = (UCHAR)(args->lba);        // LBA [7:0]
+
+    // �]�m 32-bit Transfer Length
+    sptdwb.sptd.Cdb[10] = (UCHAR)(args->sector_cnt >> 24);  // Length [31:24]
+    sptdwb.sptd.Cdb[11] = (UCHAR)(args->sector_cnt >> 16);  // Length [23:16]
+    sptdwb.sptd.Cdb[12] = (UCHAR)(args->sector_cnt >> 8);   // Length [15:8]
+    sptdwb.sptd.Cdb[13] = (UCHAR)(args->sector_cnt);        // Length [7:0]
+
+    // ��l�줸�եi�]�� 0
+    sptdwb.sptd.Cdb[14] = 0x00;  // Reserved
+    sptdwb.sptd.Cdb[15] = 0x00;  // Control
+
+    // 4. ���� SCSI �R�O
+    status = DeviceIoControl(fileHandle,
+        IOCTL_SCSI_PASS_THROUGH_DIRECT,
+        &sptdwb,
+        sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER),
+        &sptdwb,
+        sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER),
+        &returned,
+        NULL);
+
+    // 5. �ˬd���浲�G
+    if (!status) {
+        printf("DeviceIoControl ����, ���~�X: %lu\n", GetLastError());
+        PrintError(GetLastError());
+    }
+    else if (sptdwb.sptd.ScsiStatus != 0) {
+        printf("SCSI �R�O���楢��, SCSI ���A: %02Xh\n", sptdwb.sptd.ScsiStatus);
+        PrintSenseInfo((PSCSI_PASS_THROUGH_WITH_BUFFERS)&sptdwb);
+        // ��ܧ��㪺 sense data
+        for (ULONG i = 0; i < SPT_SENSE_LENGTH; i++) {
+            printf("%02X ", sptdwb.ucSenseBuf[i]);
+            if ((i + 1) % 16 == 0) printf("\n");
+        }
+        printf("\n");
+
+        // �ѪR sense data
+        if (sptdwb.ucSenseBuf[0] == 0x70 || sptdwb.ucSenseBuf[0] == 0x71) {
+            UCHAR senseKey = sptdwb.ucSenseBuf[2] & 0x0F;
+            UCHAR asc = sptdwb.ucSenseBuf[12];
+            UCHAR ascq = sptdwb.ucSenseBuf[13];
+
+            printf("Sense Key: %02Xh - ", senseKey);
+            switch (senseKey) {
+            case 0x0: printf("No Sense\n"); break;
+            case 0x1: printf("Recovered Error\n"); break;
+            case 0x2: printf("Not Ready\n"); break;
+            case 0x3: printf("Medium Error\n"); break;
+            case 0x4: printf("Hardware Error\n"); break;
+            case 0x5: printf("Illegal Request\n"); break;
+            case 0x6: printf("Unit Attention\n"); break;
+            case 0x7: printf("Data Protect\n"); break;
+            case 0x8: printf("Blank Check\n"); break;
+            case 0x9: printf("Vendor Specific\n"); break;
+            case 0xA: printf("Copy Aborted\n"); break;
+            case 0xB: printf("Aborted Command\n"); break;
+            case 0xC: printf("Equal\n"); break;
+            case 0xD: printf("Volume Overflow\n"); break;
+            case 0xE: printf("Miscompare\n"); break;
+            case 0xF: printf("Completed\n"); break;
+            default: printf("Unknown\n"); break;
+            }
+
+            printf("Additional Sense Code (ASC): %02Xh\n", asc);
+            printf("Additional Sense Code Qualifier (ASCQ): %02Xh\n", ascq);
+        }
+    }
+    else {
+        // ���\Ū���A��ܼƾ�
+        printf("\nRead data�G\n");
+        PrintDataBuffer(dataBuffer, bufferSize);
+    }
+
+    // 6. �M�z�귽
+    if (pUnAlignedBuffer) {
+        free(pUnAlignedBuffer);
+    }
+    printf("\n*********************************************** read end ****************************************************\n");
+}
+
+
 VOID
 __cdecl
 main(
@@ -81,6 +431,7 @@ main(
     )
 
 {
+    CommandLineArgs args;
     BOOL status = 0;
     DWORD accessMode = 0, shareMode = 0;
     HANDLE fileHandle = NULL;
@@ -92,12 +443,19 @@ main(
     SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER sptdwb;
     SCSI_PASS_THROUGH_WITH_BUFFERS_EX sptwb_ex;
     SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER_EX sptdwb_ex;
-    CHAR string[NAME_COUNT];
+    //CHAR string[NAME_COUNT];
+    CHAR devicePath[MAX_PATH];
 
     ULONG length = 0,
           errorCode = 0,
           returned = 0,
           sectorSize = 512;
+    
+
+    if (!parse_arguments(argc, argv, &args)) {
+        print_usage(argv[0]);
+        return;
+    }
 
     if ((argc < 2) || (argc > 3)) {
        printf("Usage:  %s <port-name> [-mode]\n", argv[0] );
@@ -109,10 +467,22 @@ main(
        return;
     }
 
-    StringCbPrintf(string, sizeof(string), "\\\\.\\%s", argv[1]);
+    //StringCbPrintf(string, sizeof(string), "\\\\.\\%s", argv[1]);
 
     shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;  // default
     accessMode = GENERIC_WRITE | GENERIC_READ;       // default
+
+    if (args.is_read) {
+        shareMode = FILE_SHARE_READ;
+    }
+    else if (args.is_write) {
+        shareMode = FILE_SHARE_WRITE;
+    }
+    if (!GetDiskPath(args.disk_number, devicePath, sizeof(devicePath))) {
+        fputs("Error creating device path for disk", stderr);
+        //printf("Error creating device path for disk %d\n", args.disk_number);
+        return;
+    }
 
     if (argc == 3) {
 
@@ -155,6 +525,23 @@ main(
         return;
     }
 
+    DISK_GEOMETRY diskGeometry;
+    DWORD bytesReturned;
+
+    if (!DeviceIoControl(fileHandle,
+        IOCTL_DISK_GET_DRIVE_GEOMETRY,
+        NULL,
+        0,
+        &diskGeometry,
+        sizeof(diskGeometry),
+        &bytesReturned,
+        NULL)) {
+        printf("Error getting disk geometry. Error: %d\n", GetLastError());
+        CloseHandle(fileHandle);
+        return;
+    }
+
+
     //
     // Get the alignment requirements
     //
@@ -177,6 +564,14 @@ main(
     //
     // Send SCSI Pass Through
     //
+    
+    //////////////// read and write ///////////////////////////////////////////////////////////
+    if (args.is_read) {
+        PerformRead(fileHandle, &args, alignmentMask);
+    }
+    else if (args.is_write) {
+        PerformWrite(fileHandle, &args, alignmentMask);
+    }
 
     puts("            ***** MODE SENSE -- return all pages *****");
     puts("            *****      with SenseInfo buffer     *****\n");
